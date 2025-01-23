@@ -1,0 +1,11 @@
+# 模型文件
+*.bin
+*.pt
+*.pth
+# 缓存文件
+__pycache__/
+.ipynb_checkpoints/
+*.py[cod]
+# 日志目录
+log
+model/hubert-base/

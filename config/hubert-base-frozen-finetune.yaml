@@ -1,0 +1,59 @@
+### Freeze the encoder of self-supervised pretrained Hubert, only finetune the classifier ###
+
+trainer:
+  devices:
+    - 0
+  logger:
+      # Logger to save the logs, configs, hyperparameters and checkpoints
+      class_path: lightning.pytorch.loggers.TensorBoardLogger
+      init_args:
+        # Save path
+        save_dir: log
+        # Sub-path of the save path
+        name: hubert-base-frozen-finetune
+  callbacks:
+      # Show epoch instead of step on tensor board
+    - class_path: util.callback.OverrideEpochStepCallback
+      # Freeze encoder
+    - class_path: util.callback.FreezeEncoderFinetuneClassifier
+      # Monitor learning rate on tensor board
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: epoch
+      # Save the best model with highest validation accuracy
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        save_top_k: 1
+        monitor: val_loss
+        mode: min
+        filename: '{epoch}-{val_loss:.4f}'
+        save_weights_only: True
+  # Max training epochs
+  max_epochs: 60
+  
+
+model:
+  class_path: model.lit_model.LitAccentIdentificationSystem
+  init_args:
+    backbone:
+      class_path: model.backbone.HubertBaseLoadCheckpoint
+      init_args:
+          ckpt_path: model/hubert-base/chinese-hubert-base.pt
+          num_classes: 25045
+    data_augmentation:
+      mix_up:
+        class_path: util.data_aug.MixUp
+        init_args:
+          alpha: 0.3
+
+data:
+  class_path: data.KeSpeechDataModule
+  init_args:
+    meta_dir: ../KeSpeech/Tasks/SpeakerVeri  # 根据实际路径调整
+    audio_dir: ../KeSpeech/Audio
+    batch_size: 16
+    num_workers: 16
+    pin_memory: true
+
+optimizer:
+  class_path: torch.optim.Adam

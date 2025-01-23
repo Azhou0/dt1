@@ -1,0 +1,935 @@
+#config
+# lightning.pytorch==2.4.0
+seed_everything: 0
+trainer:
+  accelerator: auto
+  strategy: auto
+  devices:
+  - 0
+  num_nodes: 1
+  precision: 16
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: log
+      name: hubert-base-unfrozen-finetune
+      version: null
+      log_graph: false
+      default_hp_metric: true
+      prefix: ''
+      sub_dir: null
+      comment: ''
+      purge_step: null
+      max_queue: 10
+      flush_secs: 120
+      filename_suffix: ''
+  callbacks:
+  - class_path: util.callback.OverrideEpochStepCallback
+  - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+    init_args:
+      logging_interval: epoch
+      log_momentum: false
+      log_weight_decay: false
+  - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+    init_args:
+      dirpath: null
+      filename: '{epoch}-{val_acc:.4f}'
+      monitor: val_acc
+      verbose: false
+      save_last: null
+      save_top_k: 1
+      save_weights_only: false
+      mode: max
+      auto_insert_metric_name: true
+      every_n_train_steps: null
+      train_time_interval: null
+      every_n_epochs: null
+      save_on_train_epoch_end: null
+      enable_version_counter: true
+  fast_dev_run: false
+  max_epochs: 30
+  min_epochs: null
+  max_steps: -1
+  min_steps: null
+  max_time: null
+  limit_train_batches: null
+  limit_val_batches: null
+  limit_test_batches: null
+  limit_predict_batches: null
+  overfit_batches: 0.0
+  val_check_interval: null
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: null
+  log_every_n_steps: null
+  enable_checkpointing: null
+  enable_progress_bar: null
+  enable_model_summary: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: null
+  gradient_clip_algorithm: null
+  deterministic: null
+  benchmark: null
+  inference_mode: true
+  use_distributed_sampler: true
+  profiler: null
+  detect_anomaly: false
+  barebones: false
+  plugins: null
+  sync_batchnorm: false
+  reload_dataloaders_every_n_epochs: 0
+  default_root_dir: null
+model:
+  class_path: model.lit_model.LitAscWithWarmupLinearDownScheduler
+  init_args:
+    optimizer:
+      class_path: torch.optim.AdamW
+      init_args:
+        lr: 1.0e-05
+        betas:
+        - 0.9
+        - 0.98
+        eps: 1.0e-08
+        weight_decay: 0.01
+        amsgrad: false
+        maximize: false
+        foreach: null
+        capturable: false
+        differentiable: false
+        fused: null
+    warmup_len: 4
+    down_len: 26
+    min_lr: 0.005
+    backbone:
+      class_path: model.backbone.HubertBaseLoadCheckpoint
+      init_args:
+        ckpt_path: model/hubert-base/chinese-hubert-base.pt
+        num_classes: 9
+    data_augmentation:
+      mix_up:
+        class_path: util.data_aug.MixUp
+        init_args:
+          alpha: 0.3
+    use_contrastive_loss: true
+data:
+  class_path: data.KeSpeechDataModule
+  init_args:
+    meta_dir: ../KeSpeech/Tasks/SubdialectID
+    audio_dir: ../KeSpeech/Audio
+    batch_size: 16
+    num_workers: 16
+    pin_memory: true
+    predict_subset: ''
+optimizer: null
+lr_scheduler: null
+ckpt_path: log/hubert-base-unfrozen-finetune/version_43/checkpoints/epoch=4-val_acc=0.8349.ckpt
+# backbone.py
+import torch
+from torch import nn
+from fairseq import checkpoint_utils
+
+class SingleLinearClassifier(nn.Module):
+    def __init__(self, in_features: int, num_classes: int):
+        super(SingleLinearClassifier, self).__init__()
+        self.act = nn.ReLU()
+        self.linear = nn.Linear(in_features, num_classes)
+
+    def forward(self, x):
+        x = self.act(x)
+        x = self.linear(x)
+        x = x.mean(dim=1)
+        return x
+
+class HubertBaseLoadCheckpoint(nn.Module):
+    def __init__(self, ckpt_path: str, num_classes: int):
+        super().__init__()
+        print(f"Loading model(s) from {ckpt_path}")
+        models, self.saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task([ckpt_path], suffix="")
+        print(f"Loaded model(s) from {ckpt_path}")
+        print(f"Normalize: {self.saved_cfg.task.normalize}")
+        self.encoder = models[0]
+        self.classifier = SingleLinearClassifier(in_features=self.saved_cfg.model.encoder_embed_dim, num_classes=num_classes)
+
+    def forward(self, x):
+        padding_mask = torch.BoolTensor(x.shape).fill_(False).to(x.device)
+        inputs = {"source": x, "padding_mask": padding_mask}
+        feats = self.encoder.extract_features(**inputs)[0]
+        y_hat = self.classifier(feats)
+        return y_hat
+
+class Accent2SpeakerLoadCheckpoint(nn.Module):
+    def __init__(self, ckpt_path_hubert, ckpt_path_accent, num_classes, *args, **kwargs):
+        """
+        初始化 Accent2SpeakerLoadCheckpoint 类。
+
+        参数:
+        - ckpt_path_hubert: HuBERT 模型的路径
+        - ckpt_path_accent: 预训练的口音模型的路径
+        - num_classes: 输出类别的数量，通常是口音分类的类别数量
+        """
+        super(Accent2SpeakerLoadCheckpoint, self).__init__()
+
+        self.num_classes = num_classes
+        self.ckpt_path_hubert = ckpt_path_hubert
+        self.ckpt_path_accent = ckpt_path_accent
+        
+        # 假设使用的是 HuBERT 和自定义的 Accent 分类器
+        self.hubert_model = self.load_hubert_model(ckpt_path_hubert)
+        self.accent_model = self.load_accent_model(ckpt_path_accent)
+
+        # 假设你使用一个线性层进行分类
+        self.classifier = nn.Linear(self.hubert_model.output_dim, self.num_classes)
+
+    def load_hubert_model(self, ckpt_path):
+    # Example implementation using fairseq
+        print(f"Loading HuBERT model from {ckpt_path}")
+        models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task([ckpt_path], suffix="")
+        hubert_model = models[0]
+        hubert_model.output_dim = saved_cfg.model.encoder_embed_dim  # or whatever the correct dimension is
+        return hubert_model
+
+    def load_accent_model(self, ckpt_path):
+        # Similar implementation for the accent model
+        # Note: This needs to match how the accent model was saved
+        print(f"Loading accent model from {ckpt_path}")
+        models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task([ckpt_path], suffix="")
+        accent_model = models[0]
+        return accent_model
+
+    def forward(self, x):
+        """
+        前向传播：提取特征并进行分类。
+
+        参数:
+        - x: 输入的音频数据
+
+        返回:
+        - 分类结果
+        """
+        # 使用 HuBERT 模型提取特征
+        features = self.hubert_model(x)
+
+        # 使用口音模型处理特征
+        accent_features = self.accent_model(features)
+
+        # 使用分类器进行最终的口音分类
+        output = self.classifier(accent_features)
+        
+        return output
+# lit_model.py
+import lightning.pytorch as L
+from typing import Dict, Optional
+
+import numpy as np
+import torch
+import torchinfo
+import torch.nn.functional as F
+from model.backbone import Accent2SpeakerLoadCheckpoint
+from util.data_aug import _DataAugmentation
+from util.lr_scheduler import exp_warmup_linear_down
+from util.result_analysis import get_confusion_matrix
+from lightning.pytorch.cli import OptimizerCallable
+
+class LitAccentIdentificationSystem(L.LightningModule):
+    def __init__(self,
+                 backbone: Accent2SpeakerLoadCheckpoint,
+                 data_augmentation: Dict[str, Optional[_DataAugmentation]]):
+        super(LitAccentIdentificationSystem, self).__init__()
+        # Save the hyperparameters for Tensorboard visualization, 'backbone' and 'spec_extractor' are excluded.
+        self.save_hyperparameters(ignore=['backbone'])
+        self.backbone = backbone
+        self.data_aug = data_augmentation
+
+        # Save data during testing for statistical analysis
+        self._test_step_outputs = {'y': [], 'pred': []}
+        # Input size of a sample, used for generating model profile.
+        self._test_input_size = None
+
+        # Save data during prediction
+        self.pred_step_outputs = {'y_hat1': [], 'y_hat2': [], 'sim': []}
+        num_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"Trainable parameters: {num_params}")
+
+    @staticmethod
+    def accuracy(logits, labels):
+        pred = torch.argmax(logits, dim=1)
+        acc = torch.sum(pred == labels).item() / len(labels)
+        return acc, pred
+
+    def forward(self, x):
+        return self.backbone(x)
+
+    def training_step(self, batch, batch_idx):
+        # Load a batch of waveforms with size (N, X)
+        x = batch[0]
+        # Load subdialect label
+        y = batch[1]
+        # Instantiate data augmentation
+        mix_up = self.data_aug.get('mix_up')
+        # Apply mixup augmentation on waveform
+        if mix_up is not None:
+            x, y = mix_up(x, y)
+        # Get the predicted labels
+        y_hat = self(x)
+        # Calculate the loss and accuracy
+        if mix_up is not None:
+            pred = torch.argmax(y_hat, dim=1)
+            train_loss = mix_up.lam * F.cross_entropy(y_hat, y[0]) + (1 - mix_up.lam) * F.cross_entropy(y_hat, y[1])
+            corrects = (mix_up.lam * torch.sum(pred == y[0]) + (1 - mix_up.lam) * torch.sum(pred == y[1]))
+            train_acc = corrects.item() / len(x)
+        else:
+            train_loss = F.cross_entropy(y_hat, y)
+            train_acc, _ = self.accuracy(y_hat, y)
+        # Log for each epoch
+        self.log_dict({'train_loss': train_loss, 'train_acc': train_acc}, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return train_loss
+
+    def validation_step(self, batch, batch_idx):
+        x = batch[0]
+        y = batch[1]
+        y_hat = self(x)
+        val_loss = F.cross_entropy(y_hat, y)
+        val_acc, _ = self.accuracy(y_hat, y)
+        self.log_dict({'val_loss': val_loss, 'val_acc': val_acc}, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return val_acc
+
+    def test_step(self, batch, batch_idx):
+        x = batch[0]
+        y = batch[1]
+        # Get the input size of feature for measuring model profile
+        self._test_input_size = (1, x.size(-1))
+        y_hat = self(x)
+        test_loss = F.cross_entropy(y_hat, y)
+        test_acc, pred = self.accuracy(y_hat, y)
+        self.log_dict({'test_loss': test_loss, 'test_acc': test_acc})
+
+        self._test_step_outputs['y'] += y.cpu().numpy().tolist()
+        self._test_step_outputs['pred'] += pred.cpu().numpy().tolist()
+        return test_acc
+
+    def on_test_epoch_end(self):
+        tensorboard = self.logger.experiment
+        # Summary the model profile
+        print("\n Model Profile:")
+        model_profile = torchinfo.summary(self.backbone, input_size=self._test_input_size)
+        macc = model_profile.total_mult_adds
+        params = model_profile.total_params
+        print('MACC:\t \t %.6f' % (macc / 1e6), 'M')
+        print('Params:\t \t %.3f' % (params / 1e3), 'K\n')
+        # Generate a confusion matrix figure
+        from util.unique_labels import unique_labels
+        cm = get_confusion_matrix(self._test_step_outputs, unique_labels['subdialect'])
+        tensorboard.add_figure('confusion_matrix', cm)
+
+    def predict_step(self, batch):
+        x1 = batch[0]
+        x2 = batch[1]
+        y_hat1 = self(x1)
+        y_hat2 = self(x2)
+        sim = F.cosine_similarity(y_hat1, y_hat2, dim=-1)
+        sim = sim.reshape(-1, 1)
+        y_hat1 = F.softmax(y_hat1, dim=1)
+        y_hat2 = F.softmax(y_hat2, dim=1)
+
+        self.pred_step_outputs['y_hat1'] += y_hat1.cpu().numpy().tolist()
+        self.pred_step_outputs['y_hat2'] += y_hat2.cpu().numpy().tolist()
+        self.pred_step_outputs['sim'] += sim.cpu().numpy().tolist()
+        return sim
+
+class LitAscWithWarmupLinearDownScheduler(LitAccentIdentificationSystem):
+    """
+    ASC system with warmup-linear-down scheduler.
+    """
+    def __init__(self, optimizer: OptimizerCallable, warmup_len=4, down_len=26, min_lr=0.005, **kwargs):
+        super(LitAscWithWarmupLinearDownScheduler, self).__init__(**kwargs)
+        self.optimizer = optimizer
+        self.warmup_len = warmup_len
+        self.down_len = down_len
+        self.min_lr = min_lr
+
+    def configure_optimizers(self):
+        optimizer = self.optimizer(self.parameters())
+        schedule_lambda = exp_warmup_linear_down(self.warmup_len, self.down_len, self.warmup_len, self.min_lr)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule_lambda)
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+
+class LitAccent2Speaker(L.LightningModule):
+    def __init__(self, backbone: Accent2SpeakerLoadCheckpoint, data_augmentation: Dict[str, Optional[_DataAugmentation]]):
+        super().__init__()
+        if not isinstance(backbone, Accent2SpeakerLoadCheckpoint):
+            raise TypeError(f"Expected backbone of type Accent2SpeakerLoadCheckpoint, got {type(backbone)}")
+            self.backbone = backbone
+            self.data_aug = data_augmentation
+            # Save data during testing for statistical analysis
+            self._test_step_outputs = {'y': [], 'y_hat': []}
+
+    def forward(self, x1, x2):
+        return self.backbone(x1, x2)
+
+    @staticmethod
+    def cal_binary_metric(y_hat, y, save_to=None, name=""):
+        y_hat = np.array(y_hat)
+        y = np.array(y)
+        # 将概率转换为二进制预测，阈值设为0.5
+        predictions = (y_hat >= 0.5).astype(int)
+        targets = y.astype(int)
+        # 计算TP, FP, FN
+        TP = np.sum((predictions == 1) & (y == 1))
+        FP = np.sum((predictions == 1) & (y == 0))
+        FN = np.sum((predictions == 0) & (y == 1))
+        TN = np.sum((predictions == 0) & (y == 0))
+        str1 = f"TP: {TP}, FP: {FP}, FN: {FN}, TN: {TN}"
+        print("\n" + str1)
+        # 计算精确率和召回率
+        precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+        recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        str2 = f"Precision: {precision:.3f}, Recall: {recall:.3f}, F1_Score: {f1:.3f}"
+        print(str2)
+        if save_to is not None:
+            with open(f'{save_to}result-{name}.txt', 'w', encoding='utf-8') as file:
+                print(str1, file=file)
+                print(str2, file=file)
+                print(f"Successfully save result to {save_to}")
+
+    def training_step(self, batch, batch_idx):
+        # Load a batch of waveforms with size (N, X)
+        x1 = batch[0]
+        x2 = batch[1]
+        # Load subdialect label
+        y = batch[2]
+        # Initialize mixup module
+        mix_up = self.data_aug.get('mix_up')
+        if mix_up is not None:
+            x_out, y_out = mix_up([x1, x2], [y])
+            x1, x2 = x_out[0], x_out[1]
+            y = y_out[0]
+        # Get the predicted labels
+        y_hat = self(x1, x2)
+        y_hat = torch.sigmoid(y_hat).squeeze(-1)
+        # Calculate the loss and accuracy
+        train_loss = mix_up.loss_calculate(y_hat, y, F.binary_cross_entropy) if mix_up is not None else F.binary_cross_entropy(y_hat, y)
+        pred = (y_hat > 0.5).float()  # 使用0.5作为阈值进行分类
+        train_acc = mix_up.accuracy_calculate(pred, y) if mix_up is not None else torch.sum(pred == y).item() / len(y)
+        # Log for each epoch
+        self.log_dict({'train_loss': train_loss, 'train_acc': train_acc}, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return train_loss
+
+    def validation_step(self, batch, batch_idx):
+        x1 = batch[0]
+        x2 = batch[1]
+        y = batch[2]
+        y_hat = self(x1, x2)
+        y_hat = torch.sigmoid(y_hat).squeeze(-1)
+        # Calculate the loss
+        val_loss = F.binary_cross_entropy(y_hat, y)
+        pred = (y_hat > 0.5).float()  # 使用0.5作为阈值进行分类
+        val_acc = torch.sum(pred == y).item() / len(y)
+        self.log_dict({'val_loss': val_loss, 'val_acc': val_acc}, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return val_loss
+
+    def test_step(self, batch, batch_idx):
+        x1 = batch[0]
+        x2 = batch[1]
+        y = batch[2]
+        y_hat = self(x1, x2)
+        y_hat = torch.sigmoid(y_hat).squeeze(-1)
+
+        self._test_step_outputs['y'] += y.cpu().numpy().tolist()
+        self._test_step_outputs['y_hat'] += y_hat.cpu().numpy().tolist()
+
+    def on_test_epoch_end(self):
+        y = self._test_step_outputs['y']
+        y_hat = self._test_step_outputs['y_hat']
+        # Calculate the loss
+        save_path = self.trainer.checkpoint_callback.best_model_path.split("checkpoints")[0]
+        self.cal_binary_metric(y_hat, y, save_to=save_path, name=self.trainer.datamodule.test_subset)
+
+    def predict_step(self, batch):
+        x1 = batch[0]
+        x2 = batch[1]
+        y_hat = self(x1, x2)
+        y_hat = torch.sigmoid(y_hat).squeeze(-1)
+        return y_hat
+#data
+import os
+import torch
+import numpy as np
+import soundfile as sf
+from torch.utils.data import Dataset, DataLoader
+import lightning as L 
+
+def read_utt2spk(file_path):
+    utt2spk = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) != 2:
+                raise ValueError(f"Line '{line.strip()}' is not properly formatted.")
+            audio_name, speaker_id = parts
+            utt2spk.append((audio_name, speaker_id))
+    return utt2spk
+
+def padding(audio, sr, target_duration):
+    current_length = len(audio)
+    target_length = target_duration * sr
+    # 如果当前音频长度小于目标长度，进行填充
+    if current_length < target_length:
+        # 创建填充用的静音数组
+        padded_audio = np.pad(audio, (0, target_length - current_length), mode='constant')
+        return padded_audio
+    else:
+        # 如果音频长度大于目标长度，进行裁剪
+        padded_audio = audio[:target_length]
+        return padded_audio
+
+class KeSpeechDataset(Dataset):
+    def __init__(self, meta_dir, audio_dir, subset, target_duration=10, unique_labels=None):
+        """
+        Args:
+            meta_dir (str): 元数据文件所在目录
+            audio_dir (str): 音频文件所在目录
+            subset (str): 数据子集名称，例如 "dev_phase1", "dev_phase2", "eval_combined/enroll_phase1-phase2"
+            target_duration (int, optional): 目标音频时长（秒）。默认为 10 秒。
+            unique_labels (dict, optional): 标签映射字典。默认为 None。
+        """
+        self.subset = subset
+        self.audio_dir = audio_dir
+        self.target_duration = target_duration
+        meta_file_path = os.path.join(meta_dir, subset, "utt2spk")
+        self.meta_subset = read_utt2spk(meta_file_path)
+
+        if unique_labels is None:
+            raise ValueError("unique_labels must be provided")
+        self.unique_labels = unique_labels
+
+        # 解析 subset 名称以确定包含的 phases
+        if '-' in subset.split('/')[-1]:
+            # 例如 "enroll_phase1-phase2"
+            phase_part = subset.split('/')[-1].split('_')[-1]
+            self.phases = phase_part.split('-')  # ['phase1', 'phase2']
+        else:
+            # 例如 "phase1" 或 "phase2"
+            phase_part = subset.split('/')[-1].split('_')[-1]
+            self.phases = [phase_part]  # ['phase1']
+
+    def __len__(self):
+        return len(self.meta_subset)
+
+    def __getitem__(self, i):
+        """
+        返回:
+            wav (torch.Tensor): 填充或裁剪后的音频数据
+            label (torch.Tensor): 说话人类别索引
+        """
+        row_i = self.meta_subset[i]
+        audio_name = row_i[0]
+        speaker_id = row_i[1]
+
+        # 根据 subset 中包含的 phases 查找音频文件
+        wav_path = None
+        for phase in self.phases:
+            potential_path = os.path.join(self.audio_dir, speaker_id, phase, f"{audio_name}.wav")
+            if os.path.exists(potential_path):
+                wav_path = potential_path
+                break  # 找到第一个存在的路径后跳出循环
+
+        if wav_path is None:
+            raise FileNotFoundError(f"Audio file for {audio_name} not found in phases {self.phases} under speaker {speaker_id}.")
+
+        # 读取和处理音频
+        wav, sr = sf.read(wav_path)
+        wav = padding(wav, sr, self.target_duration)
+        wav = torch.from_numpy(wav).float()
+
+        # 编码说话人标签为整数
+        label = self.unique_labels['speaker'].index(speaker_id)
+        label = torch.tensor(label, dtype=torch.long)
+
+        return wav, label
+
+class KeSpeechDataModule(L.LightningDataModule):
+    def __init__(self, meta_dir: str, audio_dir: str, batch_size: int = 16, num_workers: int = 0, pin_memory: bool = False, predict_subset=""):
+        super().__init__()
+        self.meta_dir = meta_dir
+        self.audio_dir = audio_dir
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+        self.predict_subset = predict_subset
+        self.unique_labels = None
+
+    def setup(self, stage: str):
+        if stage in ("fit", "validate", "test", "predict"):
+            # 收集所有涉及的子集名称
+            all_subsets = []
+            if stage == "fit":
+                all_subsets = ["dev_phase1", "dev_phase2"]
+            elif stage == "validate":
+                all_subsets = ["eval_combined/enroll_phase1-phase2"]
+            elif stage == "test":
+                all_subsets = ["eval_combined/test_phase1-phase2"]
+            elif stage == "predict":
+                all_subsets = [self.predict_subset]
+
+            # 收集所有说话人 ID
+            all_speakers = set()
+            for subset in all_subsets:
+                meta_file_path = os.path.join(self.meta_dir, subset, "utt2spk")
+                utt2spk = read_utt2spk(meta_file_path)
+                all_speakers.update([speaker_id for _, speaker_id in utt2spk])
+
+            self.unique_labels = {'speaker': sorted(list(all_speakers))}
+
+            # 根据 stage 初始化数据集
+            if stage == "fit":
+                self.train_set = KeSpeechDataset(
+                    meta_dir=self.meta_dir,
+                    audio_dir=self.audio_dir,
+                    subset="dev_phase1",
+                    unique_labels=self.unique_labels
+                )
+                self.valid_set = KeSpeechDataset(
+                    meta_dir=self.meta_dir,
+                    audio_dir=self.audio_dir,
+                    subset="dev_phase2",
+                    unique_labels=self.unique_labels
+                )
+            if stage == "validate":
+                self.valid_set = KeSpeechDataset(
+                    meta_dir=self.meta_dir,
+                    audio_dir=self.audio_dir,
+                    subset="eval_combined/enroll_phase1-phase2",
+                    unique_labels=self.unique_labels
+                )
+            if stage == "test":
+                self.test_set = KeSpeechDataset(
+                    meta_dir=self.meta_dir,
+                    audio_dir=self.audio_dir,
+                    subset="eval_combined/test_phase1-phase2",
+                    unique_labels=self.unique_labels
+                )
+            if stage == "predict":
+                self.predict_set = KeSpeechDataset(
+                    meta_dir=self.meta_dir,
+                    audio_dir=self.audio_dir,
+                    subset=self.predict_subset,
+                    unique_labels=self.unique_labels
+                )
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_set,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
+            pin_memory=self.pin_memory
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.valid_set,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+            pin_memory=self.pin_memory
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_set,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+            pin_memory=self.pin_memory
+        )
+
+    def predict_dataloader(self):
+        return DataLoader(
+            self.predict_set,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+            pin_memory=self.pin_memory
+        )
+#callback
+import lightning.pytorch as pl
+import numpy as np
+import pandas as pd
+import torch
+from lightning.pytorch.callbacks import BasePredictionWriter
+from util.unique_labels import unique_labels
+
+
+class OverrideEpochStepCallback(pl.callbacks.Callback):
+    """
+    Override the step axis in Tensorboard with epoch. Just ignore the warning message popped out.
+    """
+    def __init__(self) -> None:
+        super().__init__()
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        self._log_step_as_current_epoch(trainer, pl_module)
+
+    def on_test_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        self._log_step_as_current_epoch(trainer, pl_module)
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        self._log_step_as_current_epoch(trainer, pl_module)
+
+    def _log_step_as_current_epoch(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        pl_module.log("step", trainer.current_epoch)
+
+
+class FreezeEncoderFinetuneClassifier(pl.callbacks.Callback):
+    """
+    Freeze the encoder of a model while fine-tuning the classifier.
+    """
+    def __init__(self) -> None:
+        super().__init__()
+
+    def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        for layer in pl_module.backbone.classifier.children():
+            if hasattr(layer, 'reset_parameters'):
+                layer.reset_parameters()
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        # Freeze all parameters
+        for param in pl_module.backbone.parameters():
+            param.requires_grad = False
+        pl_module.backbone.eval()
+        # Unfreeze the parameters of the classifier
+        for param in pl_module.backbone.classifier.parameters():
+            param.requires_grad = True
+        pl_module.backbone.classifier.train()
+
+
+def read_pair_wav_txt(file_path):
+    pair_wav = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            data = line.strip().split()  # 使用空白字符分割每一行
+            wav1, wav2, label = data[0], data[1], data[2]
+            pair_wav.append([wav1, wav2, label])
+    return pair_wav
+
+
+class PredictionWriter(BasePredictionWriter):
+    """
+    Write the predictions of a pretrained model into a pt file.
+    """
+    def __init__(self, output_dir, meta_dir, predict_subset, write_interval="epoch"):
+        super().__init__(write_interval)
+        self.output_dir = output_dir
+        self.meta_dir = meta_dir
+        self.predict_subset = predict_subset
+
+    def write_on_batch_end(
+        self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx
+    ):
+        pass
+
+    def write_on_epoch_end(self, trainer, pl_module, predictions, batch_indices):
+        predictions = torch.cat(predictions, dim=0).cpu().numpy().tolist()
+        # Get filenames
+        meta = read_pair_wav_txt(f"{self.meta_dir}/{self.predict_subset}.txt")
+        for i in range(len(meta)):
+            meta[i].append(predictions[i])
+        with open(f'{self.output_dir}/predictions.{self.predict_subset}', 'w') as f:
+            for m in meta:
+                f.write(f"{m[0]} {m[1]} {m[2]} {m[3]}\n")
+
+
+class AccentComparisonWriter(BasePredictionWriter):
+    def __init__(self, output_dir, meta_dir, predict_subset, write_interval="epoch", similarity_threshold=0.9):
+        super().__init__(write_interval)
+        self.output_dir = output_dir
+        self.meta_dir = meta_dir
+        self.predict_subset = predict_subset
+        self.similarity_threshold = similarity_threshold
+
+    def write_on_batch_end(
+        self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx
+    ):
+        pass
+
+    def write_on_epoch_end(self, trainer, pl_module, predictions, batch_indices):
+        # Get and save the predictions
+        predictions = pl_module.pred_step_outputs
+        y_hat1 = np.array(predictions['y_hat1'])
+        y_hat2 = np.array(predictions['y_hat2'])
+        sim = np.array(predictions['sim'])
+        # Get filenames
+        meta = read_pair_wav_txt(f"{self.meta_dir}/{self.predict_subset}.txt")
+        filenames_wav1 = [file1 for file1, _ in meta]
+        filenames_wav2 = [file2 for _, file2 in meta]
+        # Get the predicted index of accent labels
+        _, predicted_indices1 = torch.max(torch.from_numpy(y_hat1), 1)
+        _, predicted_indices2 = torch.max(torch.from_numpy(y_hat2), 1)
+        # Transfer index to accent label
+        accent_labels = unique_labels['subdialect']
+        predicted_labels1 = []
+        for i in predicted_indices1:
+            predicted_labels1.append(accent_labels[i])
+        predicted_labels2 = []
+        for i in predicted_indices2:
+            predicted_labels2.append(accent_labels[i])
+        # Convert size from (N,) to (N, 1)
+        predicted_labels1_arr = np.array(predicted_labels1).reshape(-1, 1)
+        predicted_labels2_arr = np.array(predicted_labels2).reshape(-1, 1)
+        # When two predicted labels are different and the accent similarity is less than a threshold,
+        # corresponding speeches are identified as different accents
+        contrast_difference = (predicted_labels1_arr != predicted_labels2_arr) & (sim < self.similarity_threshold)
+        # True denotes same accent, False denotes different accents
+        accent_contrast_result = ~contrast_difference
+        # Make a table
+        c1c2 = np.stack((filenames_wav1, predicted_labels1), axis=1)
+        c3c4 = np.stack((filenames_wav2, predicted_labels2), axis=1)
+        y_hat1 = np.round(y_hat1, 4)
+        y_hat2 = np.round(y_hat2, 4)
+        table = np.concatenate((c1c2, y_hat1, c3c4, y_hat2, accent_contrast_result, sim), axis=1)
+        columns = ['filename1', 'accent_label1']
+        columns.extend([l+"1" for l in accent_labels])
+        columns.extend(['filename2', 'accent_label2'])
+        columns.extend([l+"2" for l in accent_labels])
+        columns.extend(['accent_contrast', 'similarity'])
+        pd_data = pd.DataFrame(table, columns=columns)
+        pd_data.to_csv(self.output_dir + f'/{self.predict_subset}_output.csv', index=False, sep='\t')
+        print('\nSuccessfully save result!')
+#data_aug
+import torch
+from torch import nn
+import numpy as np
+from torch.autograd import Variable
+
+
+class _DataAugmentation(nn.Module):
+    """ Base Module for data augmentation techniques. """
+
+
+class MixUp(_DataAugmentation):
+    def __init__(self, alpha=0.3):
+        super(MixUp, self).__init__()
+        self.alpha = alpha
+        self.lam = 1
+
+    def forward(self, x, y):
+        self.lam = np.random.beta(self.alpha, self.alpha)
+        batch_size = x.size()[0]
+        index = torch.randperm(batch_size).to(x.device)
+
+        x = self.lam * x + (1 - self.lam) * x[index, :]
+        y_a, y_b = y, y[index]
+        x, y_a, y_b = map(Variable, (x, y_a, y_b))
+        return x, (y_a, y_b)
+
+
+class MultiMixUp(_DataAugmentation):
+    def __init__(self, alpha=0.3):
+        super(MultiMixUp, self).__init__()
+        self.alpha = alpha
+        self.lam = 1
+
+    def forward(self, x: list, y: list):
+        self.lam = np.random.beta(self.alpha, self.alpha)
+        batch_size = x[0].size()[0]
+        index = torch.randperm(batch_size).to(x[0].device)
+        x_out = []
+        for x_i in x:
+            x_out_i = self.lam * x_i + (1 - self.lam) * x_i[index, :]
+            x_out.append(x_out_i)
+        y_out = []
+        for y_i in y:
+            y_a, y_b = y_i, y_i[index]
+            y_out.append((y_a, y_b))
+        return x_out, y_out
+
+    def loss_calculate(self, y_hat, y, loss_func):
+        loss = self.lam * loss_func(y_hat, y[0]) + (1 - self.lam) * loss_func(y_hat, y[1])
+        return loss
+
+    def accuracy_calculate(self, pred, y):
+        corrects = (self.lam * torch.sum(pred == y[0]) + (1 - self.lam) * torch.sum(pred == y[1]))
+        acc = corrects.item() / len(pred)
+        return acc
+#result_analysis
+import numpy as np
+from matplotlib import pyplot as plt
+from sklearn.metrics import confusion_matrix
+
+def get_confusion_matrix(inputs, class_labels):
+    _y_true = inputs['y']
+    _y_pred = inputs['pred']
+    # Compute confusion matrix
+    cm = confusion_matrix(_y_true, _y_pred)
+    # Convert to probability confusion matrix
+    cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    fig, ax = plt.subplots(figsize=(8, 8))
+    for item in ([ax.title, ax.xaxis.label, ax.yaxis.label] +
+                 ax.get_xticklabels() + ax.get_yticklabels()):
+        item.set_fontsize(20)
+    im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    # We want to show all ticks...
+    ax.set(xticks=np.arange(cm.shape[1]),
+           yticks=np.arange(cm.shape[0]))
+    ax.set_xticklabels(class_labels, fontsize=12)
+    ax.set_yticklabels(class_labels, fontsize=12)
+    ax.set_ylabel('True label')
+    ax.set_xlabel('Predicted label')
+    # Rotate the tick labels and set their alignment.
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right",
+             rotation_mode="anchor")
+    # Loop over data dimensions and create text annotations.
+    fmt = '.2f'
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, format(cm[i, j], fmt),
+                    ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+    fig.tight_layout()
+    return fig
+#lr_scheduler
+# Adapted from: https://github.com/fschmid56/cpjku_dcase23/tree/main
+
+import numpy as np
+
+
+def exp_warmup_linear_down(warmup, rampdown_length, start_rampdown, last_value):
+    """
+    Simple learning rate scheduler. This function returns the factor the maximum
+     learning rate is multiplied with. It includes:
+    1. Warmup Phase: lr exponentially increases for 'warmup' number of epochs (to a factor of 1.0)
+    2. Constant LR Phase: lr reaches max value (factor of 1.0)
+    3. Linear Decrease Phase: lr decreases linearly starting from epoch 'start_rampdown'
+    4. Finetuning Phase: phase 3 completes after 'rampdown_length' epochs, followed by a finetuning phase using
+                        a learning rate of max lr * 'last_value'
+    """
+    rampup = exp_rampup(warmup)
+    rampdown = linear_rampdown(rampdown_length, start_rampdown, last_value)
+    def wrapper(epoch):
+        return rampup(epoch) * rampdown(epoch)
+    return wrapper
+
+
+def exp_rampup(rampup_length):
+    """Exponential rampup from https://arxiv.org/abs/1610.02242"""
+    def wrapper(epoch):
+        if epoch < rampup_length:
+            epoch = np.clip(epoch, 0.5, rampup_length)
+            phase = 1.0 - epoch / rampup_length
+            return float(np.exp(-5.0 * phase * phase))
+        else:
+            return 1.0
+    return wrapper
+
+
+def linear_rampdown(rampdown_length, start=0, last_value=0):
+    def wrapper(epoch):
+        if epoch <= start:
+            return 1.
+        elif epoch - start < rampdown_length:
+            return last_value + (1. - last_value) * (rampdown_length - epoch + start) / rampdown_length
+        else:
+            return last_value
+    return wrapper
